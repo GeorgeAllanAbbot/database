@@ -1,0 +1,19 @@
+enum class ErrorCategory {
+    FileError,
+};
+
+enum class FileError {
+    FILE_INVALID_ID,
+    FILE_INVALID_ARGUMENT,
+    FILE_ALREADY_EXISTS,
+    FILE_CREATE_ERROR,
+    FILE_OPEN_ERROR,
+    FILE_NOT_FOUND,
+    FILE_CLOSE_ERROR,
+    FILE_SEEK_ERROR,
+    FILE_SHORT_READ,
+    FILE_WRITE_ERROR,
+    FILE_REMOVE_ERROR,
+    FILE_INVALID_PAGE_ID,
+    FILE_PAGE_NOT_FOUND
+};
