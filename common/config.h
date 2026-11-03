@@ -17,6 +17,9 @@ inline constexpr std::size_t MAX_COLUMNS_PER_TABLE = 10;
 // 单列数据的最大长度，单位为字节。
 inline constexpr std::size_t MAX_COLUMN_BYTES = 2048;
 
+// 基础记录格式要求所有列的最大数据长度之和不超过 2048 字节。
+inline constexpr std::size_t MAX_RECORD_DATA_BYTES = 2048;
+
 // 表名和列名的最大长度，单位为字节，不包含字符串结束符。
 inline constexpr std::size_t MAX_TABLE_NAME_BYTES = 32;
 inline constexpr std::size_t MAX_COLUMN_NAME_BYTES = 32;

@@ -1,9 +1,9 @@
-# Database 文件与页缓存模块
+# Database 存储模块
 
-本模块为上层记录管理器、索引和 `DiskBPlusTree` 提供两层存储能力：
+目前实现了文件与页缓存、定长记录管理和磁盘 B+ 树。记录模块的接口、磁盘格式和示例见 [record_manage/README.md](record_manage/README.md)。
 
 ```text
-调用方 → bufPageManager（按页缓存、脏页写回） → FileManager（随机文件 I/O） → 磁盘
+RecordManager / DiskBPlusTree → bufPageManager（按页缓存、脏页写回） → FileManager → 磁盘
 ```
 
 公开头文件：
@@ -12,7 +12,18 @@
 #include "file_manage/file_manage.h"
 #include "file_manage/buf_page_manager.h"
 #include "backend/disk_b_plus_tree.h"
+#include "record_manage/record_manager.h"
 ```
+
+通过 CMake 构建 `record_manage` 目标即可使用记录管理模块，它会自动链接 `file_manage`：
+
+```sh
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug
+cmake --build build -j2
+ctest --test-dir build --output-on-failure
+```
+
+CTest 覆盖记录编解码、Schema 校验和恢复、增删改查、空闲槽复用、流式扫描、随机操作模型比对、损坏文件检查、B+ 树与 RID 联动，以及独立进程间的持久化。测试也会重复包含公共错误头文件，防止枚举重复定义问题回归。设置 `-DBUILD_TESTING=OFF` 可仅构建存储库。
 
 ## 公共类型与异常
 

@@ -1,5 +1,22 @@
+#pragma once
+
 enum class ErrorCategory {
     FileError,
+    RecordError,
+};
+
+enum class RecordError {
+    INVALID_SCHEMA,
+    TYPE_MISMATCH,
+    VALUE_TOO_LONG,
+    NULL_NOT_ALLOWED,
+    INVALID_RID,
+    RECORD_NOT_FOUND,
+    FILE_CLOSED,
+    FILE_IN_USE,
+    CORRUPT_FILE,
+    SCAN_INVALIDATED,
+    FILE_TOO_LARGE
 };
 
 enum class FileError {
