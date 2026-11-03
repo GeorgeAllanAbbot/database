@@ -1,4 +1,5 @@
 #include "record_manager.h"
+#include "variable_page.h"
 #include <algorithm>
 #include <cstring>
 #include <filesystem>
@@ -230,7 +231,10 @@ void closeAfterFailure(FileManager& files, bufPageManager& pages, FileId id) noe
 }
 
 void validateFileHeader(const Page& header, std::uint64_t file_size) {
-    if (number(header.data(), 8) != FILE_MAGIC || number(header.data() + 8, 4) != FORMAT_VERSION ||
+    const auto version = number(header.data() + 8, 4);
+    const auto layout = number(header.data() + 48, 4);
+    if (number(header.data(), 8) != FILE_MAGIC ||
+        !((version == FORMAT_VERSION && layout == 0) || (version == 2 && layout == 1)) ||
         number(header.data() + 12, 4) != PAGE_BYTES)
         corrupt("invalid or unsupported record file header");
     const auto schema_size = number(header.data() + 16, 4);
@@ -245,9 +249,9 @@ void validateFileHeader(const Page& header, std::uint64_t file_size) {
 
 } // namespace
 
-RecordFile::RecordFile(FileManager& files, bufPageManager& pages, FileId id, Schema schema)
-    : files_(files), pages_(pages), file_id_(id), codec_(std::move(schema)),
-      slots_per_page_(slotCapacity(codec_.recordSize())) {}
+RecordFile::RecordFile(FileManager& files, bufPageManager& pages, FileId id, Schema schema, RecordLayout layout)
+    : files_(files), pages_(pages), file_id_(id), codec_(std::move(schema), layout),
+      slots_per_page_(layout == RecordLayout::VARIABLE ? detail::VariablePage::MAX_SLOTS : slotCapacity(codec_.recordSize())) {}
 
 RecordFile::~RecordFile() { try { close(); } catch (...) {} }
 
@@ -272,27 +276,42 @@ void RecordFile::writePage(PageId page, const Page& bytes) {
 void RecordFile::initialize(const std::vector<char>& schema_bytes) {
     schema_size_ = static_cast<std::uint32_t>(schema_bytes.size());
     first_data_page_ = 1 + (schema_size_ + PAGE_BYTES - 1) / PAGE_BYTES;
+    const auto schema_end = first_data_page_;
+    if (layout() == RecordLayout::VARIABLE) ++first_data_page_;
     page_count_ = first_data_page_;
     first_free_page_ = NO_PAGE;
-    for (PageId id = 1; id < first_data_page_; ++id) {
+    for (PageId id = 1; id < schema_end; ++id) {
         Page page{};
         const std::size_t offset = (id - 1) * PAGE_BYTES;
         const auto size = std::min(PAGE_BYTES, schema_bytes.size() - offset);
         std::memcpy(page.data(), schema_bytes.data() + offset, size);
         writePage(id, page);
     }
+    if (layout() == RecordLayout::VARIABLE) initializeDirectory();
     saveHeader();
 }
 
 void RecordFile::loadHeader(const Page& header) {
     schema_size_ = static_cast<std::uint32_t>(number(header.data() + 16, 4));
     first_data_page_ = 1 + static_cast<PageId>(number(header.data() + 20, 4));
+    if (layout() == RecordLayout::VARIABLE) ++first_data_page_;
     if (number(header.data() + 24, 4) != codec_.recordSize() ||
         number(header.data() + 28, 4) != slots_per_page_)
         corrupt("record layout does not match schema");
     page_count_ = static_cast<PageId>(number(header.data() + 32, 4));
     first_free_page_ = static_cast<PageId>(number(header.data() + 36, 4));
     record_count_ = number(header.data() + 40, 8);
+    if (layout() == RecordLayout::VARIABLE) {
+        variable_data_pages_ = static_cast<std::uint32_t>(number(header.data() + 52, 4));
+        const auto directories = std::max<std::uint64_t>(1,
+            (std::uint64_t(variable_data_pages_) + detail::DIRECTORY_ENTRIES - 1) / detail::DIRECTORY_ENTRIES);
+        if (first_free_page_ != NO_PAGE ||
+            page_count_ != std::uint64_t(first_data_page_ - 1) + directories + variable_data_pages_ ||
+            record_count_ > std::uint64_t(variable_data_pages_) * slots_per_page_)
+            corrupt("invalid variable page or record count");
+        readDirectory(0);
+        return;
+    }
     if ((first_free_page_ != NO_PAGE &&
          (first_free_page_ < first_data_page_ || first_free_page_ >= page_count_)) ||
         record_count_ > std::uint64_t(page_count_ - first_data_page_) * slots_per_page_)
@@ -302,15 +321,17 @@ void RecordFile::loadHeader(const Page& header) {
 void RecordFile::saveHeader() {
     Page page{};
     put(page.data(), FILE_MAGIC, 8);
-    put(page.data() + 8, FORMAT_VERSION, 4);
+    put(page.data() + 8, layout() == RecordLayout::VARIABLE ? 2 : FORMAT_VERSION, 4);
     put(page.data() + 12, PAGE_BYTES, 4);
     put(page.data() + 16, schema_size_, 4);
-    put(page.data() + 20, first_data_page_ - 1, 4);
+    put(page.data() + 20, first_data_page_ - 1 - (layout() == RecordLayout::VARIABLE ? 1 : 0), 4);
     put(page.data() + 24, codec_.recordSize(), 4);
     put(page.data() + 28, slots_per_page_, 4);
     put(page.data() + 32, page_count_, 4);
     put(page.data() + 36, first_free_page_, 4);
     put(page.data() + 40, record_count_, 8);
+    put(page.data() + 48, static_cast<std::uint32_t>(layout()), 4);
+    put(page.data() + 52, variable_data_pages_, 4);
     writePage(0, page);
 }
 
@@ -336,13 +357,20 @@ std::size_t RecordFile::slotOffset(std::uint16_t slot) const {
 
 void RecordFile::validateRID(RID rid) const {
     requireOpen();
-    if (rid.page < first_data_page_ || rid.page >= page_count_ || rid.slot >= slots_per_page_)
+    if (!isDataPage(rid.page) || rid.slot >= slots_per_page_)
         throw RecordException(RecordError::INVALID_RID, "RID is outside the data pages or slot range");
 }
 
 RID RecordFile::insert(const Record& record) {
     requireOpen();
     const auto bytes = codec_.encode(record); // 先校验，拒绝非法记录时不修改文件。
+    if (layout() == RecordLayout::VARIABLE) {
+        const auto rid = allocateVariable(bytes);
+        ++record_count_;
+        ++revision_;
+        saveHeader();
+        return rid;
+    }
     Page page{};
     PageId id = first_free_page_;
     if (id == NO_PAGE) {
@@ -377,6 +405,7 @@ RID RecordFile::insert(const Record& record) {
 
 Record RecordFile::get(RID rid) const {
     validateRID(rid);
+    if (layout() == RecordLayout::VARIABLE) return getVariable(rid);
     const auto page = readDataPage(rid.page);
     if (!occupied(page, rid.slot))
         throw RecordException(RecordError::RECORD_NOT_FOUND, "record slot is empty");
@@ -385,13 +414,20 @@ Record RecordFile::get(RID rid) const {
 
 bool RecordFile::contains(RID rid) const {
     requireOpen();
-    if (rid.page < first_data_page_ || rid.page >= page_count_ || rid.slot >= slots_per_page_) return false;
+    if (!isDataPage(rid.page) || rid.slot >= slots_per_page_) return false;
+    if (layout() == RecordLayout::VARIABLE) return containsVariable(rid);
     return occupied(readDataPage(rid.page), rid.slot);
 }
 
 void RecordFile::update(RID rid, const Record& record) {
     validateRID(rid);
     const auto bytes = codec_.encode(record);
+    if (layout() == RecordLayout::VARIABLE) {
+        updateVariable(rid, bytes);
+        ++revision_;
+        saveHeader();
+        return;
+    }
     auto page = readDataPage(rid.page);
     if (!occupied(page, rid.slot))
         throw RecordException(RecordError::RECORD_NOT_FOUND, "record slot is empty");
@@ -402,6 +438,13 @@ void RecordFile::update(RID rid, const Record& record) {
 
 void RecordFile::remove(RID rid) {
     validateRID(rid);
+    if (layout() == RecordLayout::VARIABLE) {
+        removeVariable(rid);
+        --record_count_;
+        ++revision_;
+        saveHeader();
+        return;
+    }
     auto page = readDataPage(rid.page);
     if (!occupied(page, rid.slot))
         throw RecordException(RecordError::RECORD_NOT_FOUND, "record slot is empty");
@@ -437,6 +480,20 @@ std::optional<RecordEntry> RecordScan::next() {
     if (revision_ != file_->revision_)
         throw RecordException(RecordError::SCAN_INVALIDATED, "record file changed during scan");
     while (page_ < file_->page_count_) {
+        if (!file_->isDataPage(page_)) { ++page_; continue; }
+        if (file_->layout() == RecordLayout::VARIABLE) {
+            if (!loaded_) { bytes_ = file_->readVariablePage(page_).bytes(); loaded_ = true; }
+            while (slot_ < detail::VariablePage::slotCount(bytes_)) {
+                const auto index = slot_++;
+                const auto slot = detail::VariablePage::slot(bytes_, index);
+                if (slot.kind == detail::SlotKind::RECORD)
+                    return RecordEntry{RID{page_, index}, file_->codec_.decode(bytes_.data() + slot.offset, slot.length)};
+                if (slot.kind == detail::SlotKind::FORWARD)
+                    return RecordEntry{RID{page_, index}, file_->getVariable(RID{page_, index})};
+            }
+            ++page_; slot_ = 0; loaded_ = false;
+            continue;
+        }
         if (!loaded_) { bytes_ = file_->readDataPage(page_); loaded_ = true; }
         while (slot_ < file_->slots_per_page_) {
             const auto slot = slot_++;
@@ -451,13 +508,14 @@ std::optional<RecordEntry> RecordScan::next() {
     return std::nullopt;
 }
 
-std::shared_ptr<RecordFile> RecordManager::createFile(const std::string& path, const Schema& schema) {
+std::shared_ptr<RecordFile> RecordManager::createFile(const std::string& path, const Schema& schema, RecordLayout layout) {
     const auto bytes = encodeSchema(schema);
+    RecordCodec checked(schema, layout);
     const auto normalized = normalizePath(path);
     // createFile 自身拒绝已存在的文件，绝不覆盖。
     const auto id = files_.createFile(normalized);
     try {
-        auto file = std::shared_ptr<RecordFile>(new RecordFile(files_, pages_, id, schema));
+        auto file = std::shared_ptr<RecordFile>(new RecordFile(files_, pages_, id, schema, layout));
         file->initialize(bytes);
         open_files_[normalized] = file;
         return file;
@@ -490,7 +548,8 @@ std::shared_ptr<RecordFile> RecordManager::openFile(const std::string& path) {
             const auto n = std::min(PAGE_BYTES, bytes.size() - offset);
             std::memcpy(bytes.data() + offset, pages_.getPage(id, page), n);
         }
-        auto file = std::shared_ptr<RecordFile>(new RecordFile(files_, pages_, id, decodeSchema(bytes)));
+        const auto layout = static_cast<RecordLayout>(number(header.data() + 48, 4));
+        auto file = std::shared_ptr<RecordFile>(new RecordFile(files_, pages_, id, decodeSchema(bytes), layout));
         file->loadHeader(header);
         open_files_[normalized] = file;
         return file;

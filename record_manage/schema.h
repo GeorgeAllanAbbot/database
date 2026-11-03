@@ -21,6 +21,7 @@ private:
 };
 
 enum class DataType : std::uint8_t { INT = 1, FLOAT = 2, VARCHAR = 3 };
+enum class RecordLayout : std::uint32_t { FIXED = 0, VARIABLE = 1 };
 using Value = std::variant<std::monostate, std::int32_t, double, std::string>;
 using Record = std::vector<Value>;
 
@@ -61,18 +62,24 @@ struct Schema {
     std::size_t recordSize() const;
 };
 
-// 固定宽度编码：NULL 位图 + 各列。VARCHAR 用 uint16 长度和补零的数据区。
+// 定长：NULL 位图 + 各列。变长：NULL 位图 + 数值列 + VARCHAR 结束偏移 + 实际字符串。
 // 所有数值按小端编码；FLOAT 使用 IEEE 754 binary64。
 class RecordCodec {
 public:
-    explicit RecordCodec(Schema schema);
+    explicit RecordCodec(Schema schema, RecordLayout layout = RecordLayout::FIXED);
     const Schema& schema() const noexcept { return schema_; }
     std::size_t recordSize() const noexcept { return record_size_; }
+    std::size_t minimumRecordSize() const noexcept { return minimum_size_; }
+    RecordLayout layout() const noexcept { return layout_; }
     std::vector<char> encode(const Record& record) const;
     Record decode(const char* bytes, std::size_t size) const;
 private:
     Schema schema_;
     std::size_t record_size_;
+    std::size_t minimum_size_;
+    RecordLayout layout_;
+    std::vector<char> encodeVariable(const Record& record) const;
+    Record decodeVariable(const char* bytes, std::size_t size) const;
 };
 
 } // namespace db

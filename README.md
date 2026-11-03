@@ -1,6 +1,6 @@
 # Database 存储模块
 
-目前实现了文件与页缓存、定长记录管理和磁盘 B+ 树。记录模块的接口、磁盘格式和示例见 [record_manage/README.md](record_manage/README.md)。
+目前实现了文件与页缓存、定长 / 变长记录管理和磁盘 B+ 树。记录模块的接口、磁盘格式和示例见 [record_manage/README.md](record_manage/README.md)。创建变长表时传入 `db::RecordLayout::VARIABLE`，重新打开时自动恢复模式。
 
 ```text
 RecordManager / DiskBPlusTree → bufPageManager（按页缓存、脏页写回） → FileManager → 磁盘
@@ -23,7 +23,7 @@ cmake --build build -j2
 ctest --test-dir build --output-on-failure
 ```
 
-CTest 覆盖记录编解码、Schema 校验和恢复、增删改查、空闲槽复用、流式扫描、随机操作模型比对、损坏文件检查、B+ 树与 RID 联动，以及独立进程间的持久化。测试也会重复包含公共错误头文件，防止枚举重复定义问题回归。设置 `-DBUILD_TESTING=OFF` 可仅构建存储库。
+CTest 覆盖两种记录布局的编解码、Schema 校验和恢复、增删改查、空闲槽复用、流式扫描、随机操作模型比对、损坏文件检查、B+ 树与 RID 联动，以及独立进程间的持久化。变长测试还覆盖记录反复增长 / 缩短、转发槽、碎片整理和跨空间目录页分配。测试也会重复包含公共错误头文件，防止枚举重复定义问题回归。设置 `-DBUILD_TESTING=OFF` 可仅构建存储库。
 
 ## 公共类型与异常
 

@@ -140,14 +140,20 @@ std::size_t Schema::recordSize() const {
     return size;
 }
 
-RecordCodec::RecordCodec(Schema schema) : schema_(std::move(schema)), record_size_(schema_.recordSize()) {
+RecordCodec::RecordCodec(Schema schema, RecordLayout layout)
+    : schema_(std::move(schema)), record_size_(schema_.recordSize()), minimum_size_(record_size_), layout_(layout) {
     static_assert(sizeof(double) == 8 && std::numeric_limits<double>::is_iec559,
                   "FLOAT requires IEEE 754 binary64");
+    if (layout != RecordLayout::FIXED && layout != RecordLayout::VARIABLE) invalidSchema("unknown record layout");
+    if (layout == RecordLayout::VARIABLE)
+        for (const auto& column : schema_.columns)
+            if (column.type == DataType::VARCHAR) minimum_size_ -= column.max_length;
 }
 
 std::vector<char> RecordCodec::encode(const Record& record) const {
     if (record.size() != schema_.columns.size())
         throw RecordException(RecordError::TYPE_MISMATCH, "record column count does not match schema");
+    if (layout_ == RecordLayout::VARIABLE) return encodeVariable(record);
     std::vector<char> bytes(record_size_, 0);
     std::size_t offset = (record.size() + 7) / 8;
     for (std::size_t i = 0; i < record.size(); ++i) {
@@ -174,6 +180,7 @@ std::vector<char> RecordCodec::encode(const Record& record) const {
 }
 
 Record RecordCodec::decode(const char* bytes, std::size_t size) const {
+    if (layout_ == RecordLayout::VARIABLE) return decodeVariable(bytes, size);
     if (!bytes || size != record_size_)
         throw RecordException(RecordError::CORRUPT_FILE, "invalid record byte length");
     Record record;
@@ -205,6 +212,91 @@ Record RecordCodec::decode(const char* bytes, std::size_t size) const {
         }
         offset += storedWidth(column);
     }
+    return record;
+}
+
+std::vector<char> RecordCodec::encodeVariable(const Record& record) const {
+    std::size_t size = minimum_size_;
+    for (std::size_t i = 0; i < record.size(); ++i) {
+        validateValue(schema_.columns[i], record[i]);
+        if (const auto* string = std::get_if<std::string>(&record[i])) size += string->size();
+    }
+    std::vector<char> bytes(size, 0);
+    std::size_t fixed = (record.size() + 7) / 8;
+    std::size_t offsets = fixed;
+    for (const auto& column : schema_.columns)
+        if (column.type != DataType::VARCHAR) offsets += dataWidth(column);
+    std::size_t payload = minimum_size_;
+    for (std::size_t i = 0; i < record.size(); ++i) {
+        const auto& column = schema_.columns[i];
+        const auto& value = record[i];
+        const bool null = std::holds_alternative<std::monostate>(value);
+        if (null) bytes[i / 8] = static_cast<char>(static_cast<unsigned char>(bytes[i / 8]) | (1U << (i % 8)));
+        if (column.type == DataType::VARCHAR) {
+            if (!null) {
+                const auto& string = std::get<std::string>(value);
+                std::memcpy(bytes.data() + payload, string.data(), string.size());
+                payload += string.size();
+            }
+            putUnsigned(bytes.data() + offsets, payload, 2);
+            offsets += 2;
+        } else {
+            if (!null && column.type == DataType::INT) {
+                putUnsigned(bytes.data() + fixed, static_cast<std::uint32_t>(std::get<std::int32_t>(value)), 4);
+            } else if (!null) {
+                const auto number = std::get<double>(value);
+                std::uint64_t bits;
+                std::memcpy(&bits, &number, 8);
+                putUnsigned(bytes.data() + fixed, bits, 8);
+            }
+            fixed += dataWidth(column);
+        }
+    }
+    return bytes;
+}
+
+Record RecordCodec::decodeVariable(const char* bytes, std::size_t size) const {
+    if (!bytes || size < minimum_size_ || size > record_size_)
+        throw RecordException(RecordError::CORRUPT_FILE, "invalid variable record byte length");
+    Record record(schema_.columns.size());
+    std::size_t fixed = (record.size() + 7) / 8;
+    if (record.size() % 8 && (static_cast<unsigned char>(bytes[fixed - 1]) >> (record.size() % 8)))
+        throw RecordException(RecordError::CORRUPT_FILE, "invalid unused NULL bits");
+    std::size_t offsets = fixed;
+    for (const auto& column : schema_.columns)
+        if (column.type != DataType::VARCHAR) offsets += dataWidth(column);
+    std::size_t payload = minimum_size_;
+    for (std::size_t i = 0; i < record.size(); ++i) {
+        const auto& column = schema_.columns[i];
+        const bool null = (static_cast<unsigned char>(bytes[i / 8]) & (1U << (i % 8))) != 0;
+        if (column.type == DataType::VARCHAR) {
+            const auto end = static_cast<std::size_t>(getUnsigned(bytes + offsets, 2));
+            if (end < payload || end > size || end - payload > column.max_length || (null && end != payload))
+                throw RecordException(RecordError::CORRUPT_FILE, "invalid variable column end offset");
+            if (!null) record[i] = std::string(bytes + payload, end - payload);
+            payload = end;
+            offsets += 2;
+        } else {
+            if (!null && column.type == DataType::INT) {
+                const auto bits = static_cast<std::uint32_t>(getUnsigned(bytes + fixed, 4));
+                std::int32_t number;
+                std::memcpy(&number, &bits, 4);
+                record[i] = number;
+            } else if (!null) {
+                const auto bits = getUnsigned(bytes + fixed, 8);
+                double number;
+                std::memcpy(&number, &bits, 8);
+                record[i] = number;
+            }
+            fixed += dataWidth(column);
+        }
+        try { validateValue(column, record[i]); }
+        catch (const RecordException& e) {
+            throw RecordException(RecordError::CORRUPT_FILE, std::string("invalid stored value: ") + e.what());
+        }
+    }
+    if (payload != size)
+        throw RecordException(RecordError::CORRUPT_FILE, "unexpected variable record trailing bytes");
     return record;
 }
 
